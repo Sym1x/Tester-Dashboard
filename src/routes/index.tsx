@@ -1,0 +1,251 @@
+import { createFileRoute, useNavigate, useSearch } from "@tanstack/react-router";
+import { useMemo, useState } from "react";
+import { queryOptions, useSuspenseQuery, useQueryErrorResetBoundary, useQueryClient } from "@tanstack/react-query";
+import { useEffect } from "react";
+import { useRouter } from "@tanstack/react-router";
+import { useServerFn } from "@tanstack/react-start";
+import { RefreshCw, PlayCircle } from "lucide-react";
+import type { Feature, RunResult } from "@/types/cucumber";
+import { scenarioId } from "@/types/cucumber";
+import { fetchFeatures } from "@/lib/api";
+import { reloadFeaturesFn } from "@/lib/features.functions";
+import { runAllFn } from "@/lib/run.functions";
+import { useRunsStore } from "@/store/runs";
+import { Button } from "@/components/ui/button";
+import { SummaryStats } from "@/components/dashboard/SummaryStats";
+import { FeatureCard } from "@/components/dashboard/FeatureCard";
+import { ScenarioDetailPanel } from "@/components/dashboard/ScenarioDetailPanel";
+
+interface SearchParams {
+  scenario?: string;
+}
+
+const featuresQueryOptions = queryOptions({
+  queryKey: ["features"],
+  queryFn: () => fetchFeatures(),
+});
+
+export const Route = createFileRoute("/")({
+  head: () => ({
+    meta: [
+      { title: "Tester Dashboard" },
+      { name: "description", content: "Run and inspect Cucumber feature tests by feature and scenario." },
+    ],
+  }),
+  validateSearch: (s: Record<string, unknown>): SearchParams => ({
+    scenario: typeof s.scenario === "string" ? s.scenario : undefined,
+  }),
+  loader: ({ context }) => context.queryClient.ensureQueryData(featuresQueryOptions),
+  pendingComponent: () => (
+    <div className="flex min-h-screen items-center justify-center bg-background">
+      <p className="font-mono text-xs uppercase tracking-widest text-muted-foreground">
+        Loading features…
+      </p>
+    </div>
+  ),
+  errorComponent: ErrorView,
+  component: Dashboard,
+});
+
+function ErrorView({ error, reset }: { error: Error; reset: () => void }) {
+  const router = useRouter();
+  const queryErrorReset = useQueryErrorResetBoundary();
+  useEffect(() => {
+    queryErrorReset.reset();
+  }, [queryErrorReset]);
+  return (
+    <div className="flex min-h-screen items-center justify-center bg-background px-4">
+      <div className="max-w-md space-y-3 rounded-md border border-status-fail/50 bg-status-fail/10 p-5 text-center">
+        <h2 className="font-mono text-xs uppercase tracking-widest text-status-fail">
+          Failed to load features
+        </h2>
+        <p className="font-mono text-xs text-foreground">{error.message} </p>
+        <button
+          onClick={() => {
+            reset();
+            void router.invalidate();
+          }}
+          className="rounded-sm bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90"
+        >
+          Retry
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function Dashboard() {
+  const { data: features } = useSuspenseQuery(featuresQueryOptions);
+  const { scenario: selectedId } = useSearch({ from: "/" });
+  const navigate = useNavigate({ from: "/" });
+
+  const selected = useMemo(() => {
+    if (!selectedId) return null;
+    for (const f of features as Feature[]) {
+      const s = f.scenarios.find((sc) => scenarioId(sc) === selectedId);
+      if (s) return { feature: f, scenario: s };
+    }
+    return null;
+  }, [selectedId, features]);
+
+  const setSelected = (id: string | undefined) => {
+    void navigate({ search: { scenario: id } as SearchParams });
+  };
+
+  const reload = useServerFn(reloadFeaturesFn);
+  const queryClient = useQueryClient();
+  const [reloading, setReloading] = useState(false);
+  const [reloadMsg, setReloadMsg] = useState<{ kind: "ok" | "err"; text: string } | null>(null);
+
+  const handleReload = async () => {
+    setReloading(true);
+    setReloadMsg(null);
+    try {
+      const res = await reload();
+      if (res.ok) {
+        await queryClient.invalidateQueries({ queryKey: ["features"] });
+        setReloadMsg({ kind: "ok", text: `Reloaded · ${res.count} features` });
+      } else {
+        setReloadMsg({ kind: "err", text: res.error });
+      }
+    } catch (e) {
+      setReloadMsg({ kind: "err", text: (e as Error).message });
+    } finally {
+      setReloading(false);
+      setTimeout(() => setReloadMsg(null), 4000);
+    }
+  };
+
+  const runAll = useServerFn(runAllFn);
+  const [runningAll, setRunningAll] = useState(false);
+  const [runAllMsg, setRunAllMsg] = useState<{ kind: "ok" | "err"; text: string } | null>(null);
+  const markAllRunning = useRunsStore((s) => s.markAllRunning);
+  const setBulkResults = useRunsStore((s) => s.setBulkResults);
+  const handleRunAll = async () => {
+    setRunningAll(true);
+    setRunAllMsg(null);
+    const allIds = (features as Feature[]).flatMap((f) => f.scenarios.map((s) => scenarioId(s)));
+    markAllRunning(allIds);
+    try {
+      const res = await runAll();
+      const ranAt = Date.now();
+      const entries: Record<string, RunResult> = {};
+      let passes = 0;
+      let fails = 0;
+      for (const id of allIds) {
+        const r = res.results[id];
+        if (r) {
+          entries[id] = { ...r, ranAt };
+          if (r.status === "pass") passes++;
+          else fails++;
+        } else {
+          entries[id] = { status: "idle" };
+        }
+      }
+      setBulkResults(entries);
+      if (res.error) {
+        setRunAllMsg({ kind: "err", text: res.error });
+      } else {
+        setRunAllMsg({ kind: "ok", text: `Done · ${passes} pass · ${fails} fail` });
+      }
+    } catch (e) {
+      setRunAllMsg({ kind: "err", text: (e as Error).message });
+    } finally {
+      setRunningAll(false);
+      setTimeout(() => setRunAllMsg(null), 6000);
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-background">
+      <header className="border-b border-border bg-card">
+        <div className="mx-auto flex max-w-7xl items-center justify-between gap-4 px-6 py-4">
+          <div className="flex items-center gap-3">
+            <div className="grid h-9 w-9 place-items-center rounded-sm bg-primary font-mono text-sm font-bold text-primary-foreground">
+              TD
+            </div>
+            <div>
+              <h1 className="text-base font-semibold text-foreground">Tester Dashboard</h1>
+              <p className="font-mono text-[11px] uppercase tracking-widest text-muted-foreground">
+                Dositrace Test Execution UI
+              </p>
+            </div>
+          </div>
+          <div className="flex items-center gap-3">
+            {runAllMsg && (
+              <span
+                className={`font-mono text-[11px] uppercase tracking-widest ${
+                  runAllMsg.kind === "ok" ? "text-status-pass" : "text-status-fail"
+                }`}
+              >
+                {runAllMsg.text}
+              </span>
+            )}
+
+            {reloadMsg && (
+              <span
+                className={`font-mono text-[11px] uppercase tracking-widest ${
+                  reloadMsg.kind === "ok" ? "text-status-pass" : "text-status-fail"
+                }`}
+              >
+                {reloadMsg.text}
+              </span>
+            )}
+            <Button
+              variant="default"
+              size="lg"
+              onClick={handleRunAll}
+              disabled={runningAll || reloading}
+              className="gap-2 bg-status-pass text-primary-foreground hover:bg-status-pass/90"
+            >
+              <PlayCircle className={runningAll ? "animate-pulse" : ""} />
+              {runningAll ? "Running all…" : "Run All"}
+            </Button>
+            <Button
+              variant="default"
+              size="sm"
+              onClick={handleReload}
+              disabled={reloading || runningAll}
+              className="gap-2"
+            >
+              <RefreshCw className={reloading ? "animate-spin" : ""} />
+              {reloading ? "Reloading…" : "Reload Features"}
+            </Button>
+          </div>
+        </div>
+      </header>
+
+
+      <main className="mx-auto max-w-7xl space-y-6 px-6 py-6">
+        <SummaryStats features={features} />
+
+        <div>
+          <div className="mb-3 flex items-baseline justify-between">
+            <h2 className="font-mono text-[11px] uppercase tracking-widest text-muted-foreground">
+              Features ({features.length})
+            </h2>
+          </div>
+          <div className="space-y-2">
+            {features.map((f, i) => (
+              <FeatureCard
+                key={f.name}
+                feature={f}
+                defaultOpen={i === 0}
+                onSelectScenario={setSelected}
+              />
+            ))}
+          </div>
+        </div>
+      </main>
+
+      <ScenarioDetailPanel
+        feature={selected?.feature ?? null}
+        scenario={selected?.scenario ?? null}
+        open={!!selected}
+        onOpenChange={(o) => {
+          if (!o) setSelected(undefined);
+        }}
+      />
+    </div>
+  );
+}
